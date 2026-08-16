@@ -110,12 +110,26 @@ HTML_PAGE = """<!DOCTYPE html>
   header .badge { font-size: 12px; color: #94a3b8; background: #334155; padding: 3px 10px; border-radius: 999px; }
   main { flex: 1; max-width: 860px; width: 100%; margin: 0 auto; padding: 24px 16px;
          display: flex; flex-direction: column; gap: 16px; overflow-y: auto; }
-  .msg { padding: 12px 16px; border-radius: 12px; line-height: 1.7; font-size: 15px; white-space: pre-wrap; word-break: break-word; }
+  .msg { padding: 12px 16px; border-radius: 12px; line-height: 1.7; font-size: 15px; word-break: break-word; }
   .user { background: #2563eb; align-self: flex-end; max-width: 85%; }
   .bot { background: #1e293b; border: 1px solid #334155; align-self: flex-start; max-width: 100%; }
+  .msg p { margin: 6px 0; }
+  .msg h2, .msg h3, .msg h4, .msg h5, .msg h6 { margin: 10px 0 6px; color: #f1f5f9; font-weight: 600; }
+  .msg h2 { font-size: 17px; } .msg h3 { font-size: 16px; } .msg h4 { font-size: 15px; }
+  .msg ul, .msg ol { margin: 6px 0 6px 22px; }
+  .msg li { margin: 3px 0; }
+  .msg a { color: #60a5fa; text-decoration: underline; word-break: break-all; }
+  .msg a:hover { color: #93c5fd; }
+  .msg code { background: #0f172a; border: 1px solid #334155; border-radius: 4px; padding: 1px 5px; font-size: 13px; }
+  .msg pre { background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 10px 12px; overflow-x: auto; margin: 8px 0; }
+  .msg pre code { border: none; padding: 0; }
+  .msg table { border-collapse: collapse; margin: 8px 0; width: 100%; font-size: 13px; }
+  .msg th, .msg td { border: 1px solid #334155; padding: 5px 10px; text-align: left; }
+  .msg th { background: #334155; font-weight: 600; }
   .meta { font-size: 12px; color: #64748b; margin-top: 8px; }
   .sources { margin-top: 10px; font-size: 13px; color: #94a3b8; border-top: 1px dashed #334155; padding-top: 8px; }
   .sources div { margin: 2px 0; }
+  .sources a { color: #7dd3fc; }
   form { display: flex; gap: 10px; padding: 16px; background: #1e293b; border-top: 1px solid #334155; }
   input[type=text] { flex: 1; padding: 12px 16px; border-radius: 10px; border: 1px solid #334155;
                      background: #0f172a; color: #e2e8f0; font-size: 15px; outline: none; }
@@ -153,9 +167,78 @@ function addMsg(role, html) {
 }
 function esc(s) { return s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
+// ---------- 轻量 Markdown 渲染（先转义，防 XSS） ----------
+function inline(s) {
+  const links = [];
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (m, t, u) => { links.push([t, u]); return '\\u0001L' + (links.length - 1) + '\\u0001'; });
+  s = s.replace(/(https?:\/\/[^\s<>"'\u3000)，。；、）\]]+)/g, (m) => { links.push([m, m]); return '\\u0001L' + (links.length - 1) + '\\u0001'; });
+  s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/(^|[\s(（])\*([^*\\n]+)\*(?=[\s).,，。;；:：、]|$)/g, '$1<em>$2</em>');
+  s = s.replace(/\\u0001L(\\d+)\\u0001/g, (m, i) => { const [t, u] = links[+i]; return '<a href="' + u + '" target="_blank" rel="noopener">' + t + '</a>'; });
+  return s;
+}
+
+function renderTable(rows) {
+  let html = '<table>';
+  rows.forEach((r, i) => {
+    if (/^\|[\s:|-]+\|$/.test(r)) return;
+    const cells = r.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+    const tag = i === 0 ? 'th' : 'td';
+    html += '<tr>' + cells.map(c => '<' + tag + '>' + inline(c) + '</' + tag + '>').join('') + '</tr>';
+  });
+  return html + '</table>';
+}
+
+function md(src) {
+  const lines = src.split('\\n');
+  let html = '';
+  let list = null, para = [], table = null, inCode = false, codeBuf = [];
+  const closeList = () => { if (list) { html += '</' + list + '>'; list = null; } };
+  const closePara = () => { if (para.length) { html += '<p>' + para.map(inline).join('<br>') + '</p>'; para = []; } };
+  const closeTable = () => { if (table) { html += renderTable(table); table = null; } };
+
+  for (const raw of lines) {
+    const t = raw.trim();
+    if (t.startsWith('```')) {
+      if (inCode) { html += '<pre><code>' + codeBuf.join('\\n') + '</code></pre>'; codeBuf = []; inCode = false; }
+      else { closeList(); closePara(); closeTable(); inCode = true; }
+      continue;
+    }
+    if (inCode) { codeBuf.push(raw); continue; }
+    if (!t) { closeList(); closePara(); closeTable(); continue; }
+    if (/^\|.*\|$/.test(t)) { closeList(); closePara(); (table = table || []).push(t); continue; }
+    closeTable();
+    let m;
+    if ((m = t.match(/^#{1,6}\s+(.*)$/))) {
+      closeList(); closePara();
+      const lv = Math.min(m[0].match(/^#+/)[0].length + 1, 6);
+      html += '<h' + lv + '>' + inline(m[1]) + '</h' + lv + '>';
+      continue;
+    }
+    if (/^[-*·]\s+/.test(t)) {
+      closePara();
+      if (list !== 'ul') { closeList(); html += '<ul>'; list = 'ul'; }
+      html += '<li>' + inline(t.replace(/^[-*·]\s+/, '')) + '</li>';
+      continue;
+    }
+    if (/^\d+[.、]\s+/.test(t)) {
+      closePara();
+      if (list !== 'ol') { closeList(); html += '<ol>'; list = 'ol'; }
+      html += '<li>' + inline(t.replace(/^\d+[.、]\s+/, '')) + '</li>';
+      continue;
+    }
+    closeList();
+    para.push(t);
+  }
+  if (inCode) html += '<pre><code>' + codeBuf.join('\\n') + '</code></pre>';
+  closeList(); closePara(); closeTable();
+  return html;
+}
+
 async function ask(text) {
   addMsg('user', esc(text));
-  const botEl = addMsg('bot', '思考中…');
+  const botEl = addMsg('bot', '<p>思考中…</p>');
   btn.disabled = true;
   try {
     const r = await fetch('/api/ask', {
@@ -164,15 +247,20 @@ async function ask(text) {
       body: JSON.stringify({query: text})
     });
     const data = await r.json();
-    let html = esc(data.answer || '（无回答）');
+    let html = md(esc(data.answer || '（无回答）'));
     if (data.sources && data.sources.length) {
       html += '<div class="sources"><b>来源：</b>';
       const seen = new Set();
       for (const s of data.sources) {
         const key = (s.type||'kb') + (s.media_id||'') + (s.title||'') + (s.url||'');
         if (seen.has(key)) continue; seen.add(key);
-        if (s.type === 'web') html += '<div>🌐 ' + esc(s.title || '') + ' ' + esc(s.url || '') + '</div>';
-        else html += '<div>📚 《' + esc(s.title||'') + '》(' + esc(s.type||'') + ') 段落:' + esc(s.section||'') + ' 相关度:' + (s.score||'') + '</div>';
+        if (s.type === 'web') {
+          const u = s.url || '';
+          const label = esc(s.title || u || '链接');
+          html += '<div>🌐 ' + (u ? '<a href="' + esc(u) + '" target="_blank" rel="noopener">' + label + '</a>' : label) + '</div>';
+        } else {
+          html += '<div>📚 《' + esc(s.title||'') + '》(' + esc(s.type||'') + ') 段落:' + esc(s.section||'') + ' 相关度:' + (s.score||'') + '</div>';
+        }
       }
       html += '</div>';
     }
@@ -181,7 +269,7 @@ async function ask(text) {
     }
     botEl.innerHTML = html;
   } catch (e) {
-    botEl.innerHTML = '请求失败：' + esc(String(e));
+    botEl.innerHTML = '<p>请求失败：' + esc(String(e)) + '</p>';
   }
   btn.disabled = false;
   q.focus();
@@ -194,7 +282,7 @@ form.addEventListener('submit', e => {
   q.value = '';
   ask(text);
 });
-addMsg('bot', '你好！我是影剧漫资源助手。可以问我：\\n· 《狂飙》高启强是什么人？\\n· 推荐几部高分科幻电影\\n· 好看的国漫有哪些\\n· 在哪里可以看《进击的巨人》');
+addMsg('bot', '你好！我是影剧漫资源助手。可以问我：\\n· 《狂飙》高启强是什么人？\\n· 推荐几部高分科幻电影\\n· 好看的国漫有哪些\\n· 在哪里可以看《进击的巨人》\\n（资源类问题会直接给出可点击的观看/下载链接）');
 </script>
 </body>
 </html>

@@ -55,6 +55,16 @@ class GradeDecision(BaseModel):
     relevant_indices: list[int] = Field(description="与问题相关的结果序号列表（从 0 开始）")
 
 
+# ---------------- 资源查询判定 ----------------
+
+RESOURCE_HINTS = ["观看", "资源", "下载", "链接", "在线", "在哪", "哪里", "网址", "地址", "播放", "平台", "免费", "怎么看"]
+
+
+def is_resource_query(query: str) -> bool:
+    """判断问题是否偏向「找资源/观看/下载链接」。"""
+    return any(h in query for h in RESOURCE_HINTS)
+
+
 # ---------------- Nodes ----------------
 
 def _call_structured(llm, decision_cls: type[BaseModel], prompt: ChatPromptTemplate, **kw):
@@ -144,9 +154,9 @@ def web_search_node(state: RAGState) -> dict:
     if state.get("media_type"):
         q = f"{MEDIA_TYPE_LABEL[state['media_type']]} {q}"
     q += " 资源 在线观看"
-    results = web_search_duckduckgo(q, max_results=5)
+    results = web_search_duckduckgo(q, max_results=8)
     if not results:
-        results = web_search_duckduckgo(state["keywords"], max_results=5)
+        results = web_search_duckduckgo(state["keywords"], max_results=8)
     ctx = "\n\n".join(
         f"[{i+1}] {r['title']}\n   URL: {r['url']}\n   {r['snippet']}" for i, r in enumerate(results)
     )
@@ -154,6 +164,24 @@ def web_search_node(state: RAGState) -> dict:
         "web_context": ctx,
         "web_results": results,
         "trace": state.get("trace", []) + [f"联网搜索: {len(results)} 条结果"],
+    }
+
+
+def resource_search_node(state: RAGState) -> dict:
+    """资源类问题：知识库有相关内容但用户要「观看/下载链接」时，联网补充真实链接。"""
+    title = state.get("keywords") or state.get("query", "")
+    results = web_search_duckduckgo(f"{title} 在线观看", max_results=8)
+    if not results:
+        results = web_search_duckduckgo(f"{title} 资源 下载", max_results=8)
+    if not results and state.get("media_type"):
+        results = web_search_duckduckgo(f"{MEDIA_TYPE_LABEL[state['media_type']]} {title} 免费观看", max_results=8)
+    ctx = "\n\n".join(
+        f"[{i+1}] {r['title']}\n   URL: {r['url']}\n   {r['snippet']}" for i, r in enumerate(results)
+    )
+    return {
+        "web_context": ctx,
+        "web_results": results,
+        "trace": state.get("trace", []) + [f"资源链接补充: 联网返回 {len(results)} 条"],
     }
 
 
@@ -189,7 +217,8 @@ def generate_node(state: RAGState) -> dict:
                 "要求：\n"
                 "1. 优先用本地知识库内容作答；知识库不足时再结合联网信息，并注明\"（联网信息）\"。\n"
                 "2. 引用来源：正文用 [1][2] 标注，引用编号对应下方提供的编号内容。\n"
-                "3. 找资源类问题要给出具体平台/途径，无法确定时如实说明，不要编造链接。\n"
+                "3. 资源/观看/下载类问题：必须把联网结果中的**具体链接**以 https://... 原样列出（供用户直接点击），"
+                "格式如「平台名: https://...」，并标注 [联网]；若没有真实链接则如实说明，绝不编造链接。\n"
                 "4. 使用简体中文，条理清晰。",
             ),
             (
@@ -245,6 +274,7 @@ def build_agentic_rag() -> object:
     g.add_node("retrieve", retrieve_node)
     g.add_node("grade", grade_node)
     g.add_node("web_search", web_search_node)
+    g.add_node("resource_search", resource_search_node)
     g.add_node("generate", generate_node)
     g.add_node("general", general_node)
     g.add_node("finalize", finalize_node)
@@ -258,10 +288,19 @@ def build_agentic_rag() -> object:
     g.add_edge("retrieve", "grade")
     g.add_conditional_edges(
         "grade",
-        lambda s: "web_search" if s.get("needs_web") else "generate",
-        {"web_search": "web_search", "generate": "generate"},
+        lambda s: (
+            "web_search"
+            if s.get("needs_web")
+            else ("resource_search" if is_resource_query(s.get("query", "")) else "generate")
+        ),
+        {
+            "web_search": "web_search",
+            "resource_search": "resource_search",
+            "generate": "generate",
+        },
     )
     g.add_edge("web_search", "generate")
+    g.add_edge("resource_search", "generate")
     g.add_edge("generate", "finalize")
     g.add_edge("general", "finalize")
     g.add_edge("finalize", END)
@@ -278,7 +317,7 @@ def build_react_agent() -> object:
         "你是「全网影剧漫资源助手」。回答电影/电视剧/动漫相关问题（剧情、演员、评分、推荐、资源与观看途径）。\n"
         "工具使用策略：\n"
         "1. 先调用 search_media_kb 查本地知识库；片名已知时可用 lookup_media_meta 查结构化元数据。\n"
-        "2. 知识库不足、或需要最新资源/观看渠道时，调用 search_web 联网补充。\n"
+        "2. 知识库不足、或需要资源/观看/下载渠道时，调用 search_web 联网补充，并把具体链接 https://... 原样列在回答中供用户点击。\n"
         "3. 最终回答用简体中文，标注来源（本地库/联网）。"
     )
     return create_react_agent(llm, MEDIA_TOOLS, prompt=system)
